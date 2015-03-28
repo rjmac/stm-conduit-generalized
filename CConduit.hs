@@ -29,24 +29,94 @@ import Control.Concurrent.Chan.Unagi.Bounded
 -- conduits and concurrent conduits (which may or may not involve
 -- hitting the disk!) we'll do lots of type magic
 
--- | Like '$=', but the two conduits will execute concurrently when
--- run.  This is 'buffer' with a default buffer size of 64.
+-- | An operator form of 'buffer\''.  In general you should be able to replace
+-- any use of 'Data.Conduit.$=' with '$=&' and '$$' either with '$$&'
+-- or '$=' and 'runCConduit' and suddenly reap the benefit of
+-- concurrency, if your conduits were spending time waiting on each
+-- other.
 ($=&) :: (CCatable c1 c2) => c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
 a $=& b = buffer' 64 a b
 
--- | Like '$$', but the two conduits will run concurrently.  This is
--- '($=&)' combined with 'runCConduit'.
+-- | An operator form of 'buffer'.  In general you should be able to replace
+-- any use of 'Data.Conduit.$$' with '$$&' and suddenly reap the benefit of
+-- concurrency, if your conduits were spending time waiting on each other.
 ($$&) :: (CCatable c1 c2, CRunnable (LeastCConduit c1 c2), RunConstraints (LeastCConduit c1 c2) m) => c1 () x m () -> c2 x Void m r -> m r
 a $$& b = runCConduit (a $=& b)
 
+-- | Concurrently join the producer and consumer, using a bounded queue of the
+-- given size. The producer will block when the queue is full, if it is
+-- producing faster than the consumers is taking from it. Likewise, if the
+-- consumer races ahead, it will block until more input is available.
+--
+-- Exceptions are properly managed and propagated between the two sides, so
+-- the net effect should be equivalent to not using buffer at all, save for
+-- the concurrent interleaving of effects.
+--
+-- This function is similar to 'Data.Conduit.$$'; for one more like '$=', see
+-- 'buffer\''.
 buffer :: (CCatable c1 c2, CRunnable (LeastCConduit c1 c2), RunConstraints (LeastCConduit c1 c2) m) => Int -> c1 () x m () -> c2 x Void m r -> m r
 buffer i c1 c2 = runCConduit (buffer' i c1 c2)
 
-bufferToFile :: (CFConduitLike c1, CFConduitLike c2, Serialize x, MonadBaseControl IO m, MonadIO m, MonadResource m) => Int -> Maybe Int -> FilePath -> c1 () x m () -> c2 x Void m r -> m r
+-- | Conduits are concatenable; this class describes how.
+class CCatable c1 c2 where
+  -- | Concurrently join the producer and consumer, using a bounded queue of the
+  -- given size. The producer will block when the queue is full, if it is
+  -- producing faster than the consumers is taking from it. Likewise, if the
+  -- consumer races ahead, it will block until more input is available.
+  --
+  -- Exceptions are properly managed and propagated between the two sides, so
+  -- the net effect should be equivalent to not using buffer at all, save for
+  -- the concurrent interleaving of effects.
+  --
+  -- This function is similar to 'Data.Conduit.$='; for one more like '$$', see
+  -- 'buffer'.
+  buffer' :: Int -> c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
+
+-- | Like 'buffer', except that when the bounded queue is overflowed, the
+-- excess is cached in a local file so that consumption from upstream may
+-- continue. When the queue becomes exhausted by yielding, it is filled
+-- from the cache until all elements have been yielded.
+--
+-- Note that the maximum amount of memory consumed is equal to (2 *
+-- memorySize + 1), so take this into account when picking a chunking size.
+--
+-- This function is similar to 'Data.Conduit.$$'; for one more like '$=', see
+-- 'bufferToFile\''.
+bufferToFile :: (CFConduitLike c1, CFConduitLike c2, Serialize x, MonadBaseControl IO m, MonadIO m, MonadResource m)
+                => Int -- ^ Size of the bounded queue in memory
+                -> Maybe Int -- ^ Max elements to keep on disk at one time
+                -> FilePath -- ^ Directory to write temp files to
+                -> c1 () x m ()
+                -> c2 x Void m r
+                -> m r
 bufferToFile bufsz dsksz tmpDir c1 c2 = runCConduit (bufferToFile' bufsz dsksz tmpDir c1 c2)
 
+-- | Like 'buffer\'', except that when the bounded queue is overflowed, the
+-- excess is cached in a local file so that consumption from upstream may
+-- continue. When the queue becomes exhausted by yielding, it is filled
+-- from the cache until all elements have been yielded.
+--
+-- Note that the maximum amount of memory consumed is equal to (2 *
+-- memorySize + 1), so take this into account when picking a chunking size.
+--
+-- This function is similar to 'Data.Conduit.$='; for one more like '$$', see
+-- 'bufferToFile'.
+bufferToFile' :: (CFConduitLike c1, CFConduitLike c2, Serialize x) => Int -> Maybe Int -> FilePath -> c1 i x m () -> c2 x o m r -> CFConduit i o m r
+bufferToFile' bufsz dsksz tmpDir c1 c2 = combine (asCFConduit c1) (asCFConduit c2)
+  where combine (FSingle a) b = FMultipleF bufsz dsksz tmpDir a b
+        combine (FMultiple i a as) b = FMultiple i a (bufferToFile' bufsz dsksz tmpDir as b)
+        combine (FMultipleF bufsz' dsksz' tmpDir' a as) b = FMultipleF bufsz' dsksz' tmpDir' a (bufferToFile' bufsz dsksz tmpDir as b)
+
+-- | Conduits are, once there's a producer on one end and a consumer
+-- on the other, runnable.
+class CRunnable c where
+  type RunConstraints c (m :: * -> *) :: Constraint
+  -- | Execute a conduit concurrently.  This is the concurrent
+  -- equivalent of 'runConduit'.
+  runCConduit :: (RunConstraints c m) => c () Void m r -> m r
+
 -- | Determines the result type of concurent conduit when two conduits
--- are combined with '$=&'.
+-- are combined with 'buffer\'' or '$=&'.
 type family LeastCConduit a b where
   LeastCConduit ConduitM ConduitM = CConduit
   LeastCConduit ConduitM CConduit = CConduit
@@ -59,12 +129,6 @@ type family LeastCConduit a b where
   LeastCConduit CFConduit ConduitM = CFConduit
   LeastCConduit CFConduit CConduit = CFConduit
   LeastCConduit CFConduit CFConduit = CFConduit
-
--- | Conduits are concatenable; this class describes how.
-class CCatable c1 c2 where
-  -- | Like '$=', but the two conduits will execute concurrently when
-  -- run, with upto the specified number of items bufferd.
-  buffer' :: Int -> c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
 
 instance CCatable ConduitM ConduitM where
   buffer' i a b = buffer' i (Single a) (Single b)
@@ -95,13 +159,6 @@ instance CCatable CFConduit CFConduit where
   buffer' i (FSingle a) b = FMultiple i a b
   buffer' i (FMultiple i' a as) b = FMultiple i' a (buffer' i as b)
   buffer' i (FMultipleF bufsz dsksz tmpDir a as) b = FMultipleF bufsz dsksz tmpDir a (buffer' i as b)
-
--- | Conduits are, once there's a producer on one end and a consumer
--- on the other, runnable.
-class CRunnable c where
-  type RunConstraints c (m :: * -> *) :: Constraint
-  -- | Execute a conduit concurrently.  The equivalent of 'runConduit'.
-  runCConduit :: (RunConstraints c m) => c () Void m r -> m r
 
 instance CRunnable ConduitM where
   type RunConstraints ConduitM m = (Monad m)
@@ -186,12 +243,6 @@ instance CFConduitLike CConduit where
 
 instance CFConduitLike CFConduit where
   asCFConduit = id
-
-bufferToFile' :: (CFConduitLike c1, CFConduitLike c2, Serialize x) => Int -> Maybe Int -> FilePath -> c1 i x m () -> c2 x o m r -> CFConduit i o m r
-bufferToFile' bufsz dsksz tmpDir c1 c2 = combine (asCFConduit c1) (asCFConduit c2)
-  where combine (FSingle a) b = FMultipleF bufsz dsksz tmpDir a b
-        combine (FMultiple i a as) b = FMultiple i a (bufferToFile' bufsz dsksz tmpDir as b)
-        combine (FMultipleF bufsz' dsksz' tmpDir' a as) b = FMultipleF bufsz' dsksz' tmpDir' a (bufferToFile' bufsz dsksz tmpDir as b)
 
 data BufferContext m a = BufferContext { chan :: TBQueue a
                                        , restore :: TQueue (Source m a)
