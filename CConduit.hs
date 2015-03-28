@@ -29,6 +29,16 @@ import Control.Concurrent.Chan.Unagi.Bounded
 -- conduits and concurrent conduits (which may or may not involve
 -- hitting the disk!) we'll do lots of type magic
 
+-- | Like '$=', but the two conduits will execute concurrently when
+-- run.  This is 'buffer' with a default buffer size of 64.
+($=&) :: (CCatable c1 c2) => c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
+a $=& b = buffer 64 a b
+
+-- | Like '$$', but the two conduits will run concurrently.  This is
+-- '($=&)' combined with 'runCConduit'.
+($$&) :: (CCatable c1 c2, CRunnable (LeastCConduit c1 c2), RunConstraints (LeastCConduit c1 c2) m) => c1 () x m () -> c2 x Void m r -> m r
+a $$& b = runCConduit (a $=& b)
+
 -- | Determines the result type of concurent conduit when two conduits
 -- are combined with '$=&'.
 type family LeastCConduit a b where
@@ -47,18 +57,8 @@ type family LeastCConduit a b where
 -- | Conduits are concatenable; this class describes how.
 class CCatable c1 c2 where
   -- | Like '$=', but the two conduits will execute concurrently when
-  -- run.  This is 'buffer' with a default buffer size of 64.
-  ($=&) :: c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
-  a $=& b = buffer 64 a b
-
-  -- | Like '$=', but the two conduits will execute concurrently when
   -- run, with upto the specified number of items bufferd.
   buffer :: Int -> c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
-
-  -- | Like '$$', but the two conduits will run concurrently.  This is
-  -- '($=&)' combined with 'runCConduit'.
-  ($$&) :: (CRunnable (LeastCConduit c1 c2), RunConstraints (LeastCConduit c1 c2) m) => c1 () x m () -> c2 x Void m r -> m r
-  a $$& b = runCConduit (a $=& b)
 
 instance CCatable ConduitM ConduitM where
   buffer i a b = buffer i (Single a) (Single b)
