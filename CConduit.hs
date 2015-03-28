@@ -1,6 +1,6 @@
 {-# LANGUAGE GADTs, RankNTypes, FlexibleContexts, ScopedTypeVariables, RecordWildCards, LambdaCase, TypeFamilies, MultiParamTypeClasses, ConstraintKinds, CPP #-}
 
-module CConduit (CConduit, CFConduit, ($=&), ($$&), buffer, bufferToFile, runCConduit) where
+module CConduit (CConduit, CFConduit, ($=&), ($$&), buffer, buffer', bufferToFile, bufferToFile', runCConduit) where
 
 import Control.Monad.Trans.Resource
 import Control.Exception (finally)
@@ -32,12 +32,18 @@ import Control.Concurrent.Chan.Unagi.Bounded
 -- | Like '$=', but the two conduits will execute concurrently when
 -- run.  This is 'buffer' with a default buffer size of 64.
 ($=&) :: (CCatable c1 c2) => c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
-a $=& b = buffer 64 a b
+a $=& b = buffer' 64 a b
 
 -- | Like '$$', but the two conduits will run concurrently.  This is
 -- '($=&)' combined with 'runCConduit'.
 ($$&) :: (CCatable c1 c2, CRunnable (LeastCConduit c1 c2), RunConstraints (LeastCConduit c1 c2) m) => c1 () x m () -> c2 x Void m r -> m r
 a $$& b = runCConduit (a $=& b)
+
+buffer :: (CCatable c1 c2, CRunnable (LeastCConduit c1 c2), RunConstraints (LeastCConduit c1 c2) m) => Int -> c1 () x m () -> c2 x Void m r -> m r
+buffer i c1 c2 = runCConduit (buffer' i c1 c2)
+
+bufferToFile :: (CFConduitLike c1, CFConduitLike c2, Serialize x, MonadBaseControl IO m, MonadIO m, MonadResource m) => Int -> Maybe Int -> FilePath -> c1 () x m () -> c2 x Void m r -> m r
+bufferToFile bufsz dsksz tmpDir c1 c2 = runCConduit (bufferToFile' bufsz dsksz tmpDir c1 c2)
 
 -- | Determines the result type of concurent conduit when two conduits
 -- are combined with '$=&'.
@@ -58,39 +64,37 @@ type family LeastCConduit a b where
 class CCatable c1 c2 where
   -- | Like '$=', but the two conduits will execute concurrently when
   -- run, with upto the specified number of items bufferd.
-  buffer :: Int -> c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
+  buffer' :: Int -> c1 i x m () -> c2 x o m r -> LeastCConduit c1 c2 i o m r
 
 instance CCatable ConduitM ConduitM where
-  buffer i a b = buffer i (Single a) (Single b)
+  buffer' i a b = buffer' i (Single a) (Single b)
 
 instance CCatable ConduitM CConduit where
-  buffer i a b = buffer i (Single a) b
+  buffer' i a b = buffer' i (Single a) b
 
 instance CCatable ConduitM CFConduit where
-  buffer i a b = buffer i (FSingle a) b
+  buffer' i a b = buffer' i (asCFConduit a) b
 
 instance CCatable CConduit ConduitM where
-  buffer i a b = buffer i a (Single b)
+  buffer' i a b = buffer' i a (Single b)
 
 instance CCatable CConduit CConduit where
-  buffer i (Single a) b = Multiple i a b
-  buffer i (Multiple i' a as) b = Multiple i' a (buffer i as b)
+  buffer' i (Single a) b = Multiple i a b
+  buffer' i (Multiple i' a as) b = Multiple i' a (buffer' i as b)
 
 instance CCatable CConduit CFConduit where
-  buffer i (Single a) b = buffer i (FSingle a) b
-  buffer i (Multiple i' a as) b = buffer i (FMultiple i' a $ asCFConduit as) b
+  buffer' i a b = buffer' i (asCFConduit a) b
 
 instance CCatable CFConduit ConduitM where
-  buffer i a b = buffer i a (FSingle b)
+  buffer' i a b = buffer' i a (asCFConduit b)
 
 instance CCatable CFConduit CConduit where
-  buffer i a (Single b) = buffer i a (FSingle b)
-  buffer i a (Multiple i' b bs) = buffer i a (FMultiple i' b $ asCFConduit bs)
+  buffer' i a b = buffer' i a (asCFConduit b)
 
 instance CCatable CFConduit CFConduit where
-  buffer i (FSingle a) b = FMultiple i a b
-  buffer i (FMultiple i' a as) b = FMultiple i' a (buffer i as b)
-  buffer i (FMultipleF bufsz dsksz tmpDir a as) b = FMultipleF bufsz dsksz tmpDir a (buffer i as b)
+  buffer' i (FSingle a) b = FMultiple i a b
+  buffer' i (FMultiple i' a as) b = FMultiple i' a (buffer' i as b)
+  buffer' i (FMultipleF bufsz dsksz tmpDir a as) b = FMultipleF bufsz dsksz tmpDir a (buffer' i as b)
 
 -- | Conduits are, once there's a producer on one end and a consumer
 -- on the other, runnable.
@@ -183,11 +187,11 @@ instance CFConduitLike CConduit where
 instance CFConduitLike CFConduit where
   asCFConduit = id
 
-bufferToFile :: (CFConduitLike c1, CFConduitLike c2, Serialize x) => Int -> Maybe Int -> FilePath -> c1 i x m () -> c2 x o m r -> CFConduit i o m r
-bufferToFile bufsz dsksz tmpDir c1 c2 = combine (asCFConduit c1) (asCFConduit c2)
+bufferToFile' :: (CFConduitLike c1, CFConduitLike c2, Serialize x) => Int -> Maybe Int -> FilePath -> c1 i x m () -> c2 x o m r -> CFConduit i o m r
+bufferToFile' bufsz dsksz tmpDir c1 c2 = combine (asCFConduit c1) (asCFConduit c2)
   where combine (FSingle a) b = FMultipleF bufsz dsksz tmpDir a b
-        combine (FMultiple i a as) b = FMultiple i a (bufferToFile bufsz dsksz tmpDir as b)
-        combine (FMultipleF bufsz' dsksz' tmpDir' a as) b = FMultipleF bufsz' dsksz' tmpDir' a (bufferToFile bufsz dsksz tmpDir as b)
+        combine (FMultiple i a as) b = FMultiple i a (bufferToFile' bufsz dsksz tmpDir as b)
+        combine (FMultipleF bufsz' dsksz' tmpDir' a as) b = FMultipleF bufsz' dsksz' tmpDir' a (bufferToFile' bufsz dsksz tmpDir as b)
 
 data BufferContext m a = BufferContext { chan :: TBQueue a
                                        , restore :: TQueue (Source m a)
