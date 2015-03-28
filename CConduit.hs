@@ -172,7 +172,7 @@ receiver chan = do
 data CFConduit i o m r where
   FSingle :: ConduitM i o m r -> CFConduit i o m r
   FMultiple :: Int -> ConduitM i x m () -> CFConduit x o m r -> CFConduit i o m r
-  FMultipleF :: (Serialize x) => Int -> Maybe Int -> String -> ConduitM i x m () -> CFConduit x o m r -> CFConduit i o m r
+  FMultipleF :: (Serialize x) => Int -> Maybe Int -> FilePath -> ConduitM i x m () -> CFConduit x o m r -> CFConduit i o m r
 
 class CFConduitLike a where
   asCFConduit :: a i o m r -> CFConduit i o m r
